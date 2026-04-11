@@ -30,6 +30,9 @@ jobs:
           ")
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
+      - name: Seed pip into venv
+        run: uv venv --seed
+
       - name: Build DMG
         run: uv run python packaging/build.py --macos-target 26.0
 
