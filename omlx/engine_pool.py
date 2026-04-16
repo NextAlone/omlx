@@ -27,6 +27,7 @@ import mlx.core as mx
 
 from .engine import BaseEngine, BatchedEngine
 from .engine.embedding import EmbeddingEngine
+from .engine.jang import JANGLoader
 from .engine.reranker import RerankerEngine
 from .engine.stt import STTEngine
 from .engine.sts import STSEngine
@@ -56,7 +57,6 @@ class EngineEntry:
     engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm", "audio_stt", "audio_tts", "audio_sts"]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
-    thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     engine: BaseEngine | EmbeddingEngine | RerankerEngine | STTEngine | STSEngine | TTSEngine | None = None  # Loaded engine instance
     last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)
     is_loading: bool = False  # Prevent concurrent loads
@@ -157,7 +157,6 @@ class EnginePool:
                     engine_type=info.engine_type,
                     estimated_size=info.estimated_size,
                     config_model_type=getattr(info, "config_model_type", ""),
-                    thinking_default=getattr(info, "thinking_default", None),
                     is_pinned=model_id in pinned_set,
                 )
 
@@ -441,25 +440,14 @@ class EnginePool:
         """
         Find the least recently used non-pinned loaded model.
 
-        Skips models with active inference requests to avoid interrupting
-        in-flight generation.
-
         Returns:
-            Model ID of the LRU victim, or None if no evictable model found
+            Model ID of the LRU victim, or None if all models are pinned
         """
-        candidates = []
-        for mid, e in self._entries.items():
-            if e.engine is None or e.is_pinned:
-                continue
-            try:
-                if e.engine.has_active_requests():
-                    logger.debug(
-                        f"Skipping victim '{mid}': has active requests"
-                    )
-                    continue
-            except AttributeError:
-                pass
-            candidates.append((e.last_access, mid))
+        candidates = [
+            (e.last_access, mid)
+            for mid, e in self._entries.items()
+            if e.engine is not None and not e.is_pinned
+        ]
         if not candidates:
             return None
         candidates.sort()  # Sort by last_access (oldest first)
@@ -467,11 +455,9 @@ class EnginePool:
 
     async def _unload_engine(self, model_id: str) -> None:
         """
-        Immediately stop and unload an engine with memory settle barrier.
+        Immediately stop and unload an engine.
 
-        After stopping the engine, polls mx.get_active_memory() to verify
-        Metal buffers are actually reclaimed before updating the memory
-        tracking counter.
+        This aborts any in-progress requests.
 
         Args:
             model_id: The model ID to unload
@@ -481,14 +467,16 @@ class EnginePool:
             return
 
         logger.info(f"Unloading model: {model_id} (immediate abort)")
-        pre_unload_active = mx.get_active_memory()
 
         try:
             await entry.engine.stop()
         except Exception as e:
             logger.warning(f"Error stopping engine for {model_id}: {e}")
 
-        # Clear engine reference before settle barrier
+        # Release memory tracking
+        self._current_model_memory -= entry.estimated_size
+
+        # Clear engine reference
         entry.engine = None
         entry.last_access = 0.0
 
@@ -503,73 +491,10 @@ class EnginePool:
             get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
         )
 
-        # Memory settle barrier: poll actual freed memory instead of
-        # trusting the cumulative _current_model_memory estimate.
-        # Scale tolerance with model size: estimated_size includes a 5%
-        # overhead factor (model_discovery.py) that may not be reflected in
-        # actual freed memory. Use 2 GB floor for small models. See #768.
-        settle_tolerance = max(2 * 1024**3, int(entry.estimated_size * 0.05))
-        min_expected_freed = max(0, entry.estimated_size - settle_tolerance)
-        settled = False
-        for _settle_round in range(10):
-            active_now = mx.get_active_memory()
-            actual_freed = pre_unload_active - active_now
-            if actual_freed >= min_expected_freed:
-                settled = True
-                logger.debug(
-                    f"Settle round {_settle_round + 1} for '{model_id}': "
-                    f"freed={format_size(actual_freed)} "
-                    f"(need>={format_size(min_expected_freed)}) - settled"
-                )
-                break
-            logger.debug(
-                f"Settle round {_settle_round + 1} for '{model_id}': "
-                f"freed={format_size(actual_freed)} "
-                f"(need>={format_size(min_expected_freed)}) - retry"
-            )
-            await asyncio.sleep(0.5)
-            gc.collect()
-            await loop.run_in_executor(
-                get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
-            )
-
-        # Release memory tracking AFTER barrier
-        self._current_model_memory -= entry.estimated_size
-
-        if settled:
-            logger.info(
-                f"Unloaded model: {model_id}, "
-                f"freed={format_size(actual_freed)} "
-                f"(expected>={format_size(min_expected_freed)}), "
-                f"active_memory: {format_size(active_now)} (settled)"
-            )
-        else:
-            # Barrier timed out - try emergency reclaim
-            logger.warning(
-                f"Settle barrier timed out for '{model_id}': "
-                f"freed={format_size(actual_freed)} "
-                f"(need>={format_size(min_expected_freed)})"
-            )
-            for _ in range(3):
-                gc.collect()
-                await loop.run_in_executor(
-                    get_mlx_executor(),
-                    lambda: (mx.synchronize(), mx.clear_cache()),
-                )
-                await asyncio.sleep(1.0)
-            active_after = mx.get_active_memory()
-            if active_after > self._current_model_memory + 5 * 1024**3:
-                logger.error(
-                    f"Emergency reclaim failed for '{model_id}': "
-                    f"active_memory={format_size(active_after)} "
-                    f"exceeds safe threshold "
-                    f"({format_size(self._current_model_memory + 5 * 1024**3)})"
-                )
-            else:
-                logger.info(
-                    f"Emergency reclaim succeeded: "
-                    f"active_memory={format_size(active_after)}"
-                )
+        logger.info(
+            f"Unloaded model: {model_id}, "
+            f"memory usage: {format_size(self._current_model_memory)}"
+        )
 
     async def _load_engine(self, model_id: str, force_lm: bool = False) -> None:
         """
@@ -601,105 +526,47 @@ class EnginePool:
             if self._settings_manager is not None:
                 model_settings = self._settings_manager.get_settings(model_id)
 
-            # Check if DFlash is enabled — takes priority over engine type
-            # since DFlash has its own model loading pipeline
-            engine = None
-            if model_settings is not None:
-                dflash_enabled = getattr(model_settings, "dflash_enabled", False)
-                dflash_draft = getattr(model_settings, "dflash_draft_model", None)
-                if dflash_enabled and dflash_draft:
-                    try:
-                        from .engine.dflash import DFlashEngine
-                        engine = DFlashEngine(
-                            model_name=entry.model_path,
-                            draft_model_path=dflash_draft,
-                            draft_quant_bits=getattr(model_settings, "dflash_draft_quant_bits", None),
-                            model_settings=model_settings,
-                            fallback_engine_type=effective_type,
-                            scheduler_config=self._scheduler_config,
-                        )
-                        logger.info(f"DFlash enabled for {model_id}, draft={dflash_draft}")
-                    except ImportError:
-                        logger.warning(
-                            f"DFlash enabled for {model_id} but dflash-mlx is not installed. "
-                            f"Falling back to default engine."
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            f"DFlash init failed for {model_id}: {e}. "
-                            f"Falling back to default engine."
-                        )
-
-            # Create engine based on engine type (if DFlash not active)
-            if engine is None:
-                if effective_type == "embedding":
-                    engine = EmbeddingEngine(model_name=entry.model_path)
-                elif effective_type == "reranker":
-                    engine = RerankerEngine(model_name=entry.model_path)
-                elif effective_type == "vlm":
-                    engine = VLMBatchedEngine(
-                        model_name=entry.model_path,
-                        scheduler_config=self._scheduler_config,
-                        model_settings=model_settings,
-                    )
-                elif entry.engine_type == "audio_stt":
-                    engine = STTEngine(model_name=entry.model_path)
-                elif entry.engine_type == "audio_tts":
-                    engine = TTSEngine(model_name=entry.model_path)
-                elif entry.engine_type == "audio_sts":
-                    engine = STSEngine(
-                        model_name=entry.model_path,
-                        config_model_type=entry.config_model_type,
-                    )
-                else:
-                    engine = BatchedEngine(
-                        model_name=entry.model_path,
-                        scheduler_config=self._scheduler_config,
-                        model_settings=model_settings,
-                    )
-
-            _is_dflash_engine = engine is not None and type(engine).__name__ == "DFlashEngine"
+            # Create engine based on engine type
+            if effective_type == "embedding":
+                # EmbeddingEngine for embedding models
+                engine = EmbeddingEngine(model_name=entry.model_path)
+            elif effective_type == "reranker":
+                # RerankerEngine for reranker models
+                engine = RerankerEngine(model_name=entry.model_path)
+            elif effective_type == "jang":
+                engine = JANGLoader(
+                    model_name=entry.model_path,
+                    scheduler_config=self._scheduler_config,
+                    model_settings=model_settings,
+                )
+            elif effective_type == "vlm":
+                # VLMBatchedEngine for vision-language models
+                engine = VLMBatchedEngine(
+                    model_name=entry.model_path,
+                    scheduler_config=self._scheduler_config,
+                    model_settings=model_settings,
+                )
+            elif entry.engine_type == "audio_stt":
+                engine = STTEngine(model_name=entry.model_path)
+            elif entry.engine_type == "audio_tts":
+                engine = TTSEngine(model_name=entry.model_path)
+            elif entry.engine_type == "audio_sts":
+                engine = STSEngine(
+                    model_name=entry.model_path,
+                    config_model_type=entry.config_model_type,
+                )
+            else:
+                # BatchedEngine with continuous batching (default)
+                engine = BatchedEngine(
+                    model_name=entry.model_path,
+                    scheduler_config=self._scheduler_config,
+                    model_settings=model_settings,
+                )
 
             try:
                 await engine.start()
             except Exception as start_error:
-                if _is_dflash_engine:
-                    # DFlash engine failed to start — fall back to the
-                    # model's natural engine type (VLM or Batched)
-                    logger.warning(
-                        f"DFlash start failed for {model_id}: {start_error}. "
-                        f"Falling back to {effective_type} engine."
-                    )
-                    try:
-                        await engine.stop()
-                    except Exception:
-                        pass
-                    gc.collect()
-                    loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(
-                        get_mlx_executor(),
-                        lambda: (mx.synchronize(), mx.clear_cache()),
-                    )
-
-                    if effective_type == "vlm":
-                        engine = VLMBatchedEngine(
-                            model_name=entry.model_path,
-                            scheduler_config=self._scheduler_config,
-                            model_settings=model_settings,
-                        )
-                    else:
-                        engine = BatchedEngine(
-                            model_name=entry.model_path,
-                            scheduler_config=self._scheduler_config,
-                            model_settings=model_settings,
-                        )
-                    await engine.start()
-                    logger.info(
-                        f"Successfully loaded {model_id} as {effective_type} "
-                        f"(fallback from DFlash)"
-                    )
-
-                elif force_lm and entry.engine_type == "vlm":
+                if force_lm and entry.engine_type == "vlm":
                     # force_lm created a BatchedEngine but mlx-lm can't
                     # load this VLM model — fall back to VLMBatchedEngine.
                     logger.warning(
@@ -866,7 +733,6 @@ class EnginePool:
                     "engine_type": e.engine_type,
                     "model_type": e.model_type,
                     "config_model_type": e.config_model_type,
-                    "thinking_default": e.thinking_default,
                     "last_access": e.last_access if e.last_access > 0 else None,
                 }
                 for mid, e in sorted(self._entries.items())

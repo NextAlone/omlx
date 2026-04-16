@@ -1,0 +1,62 @@
+name: Build DMG
+
+on:
+  push:
+    branches:
+      - patches
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11 + uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          python-version: '3.11'
+
+      - name: Read version
+        id: ver
+        run: |
+          VERSION=$(python -c "
+          import re, pathlib
+          f = pathlib.Path('omlx/_version.py').read_text()
+          print(re.search(r'__version__\s*=\s*\"([^\"]+)\"', f).group(1))
+          ")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Seed pip into venv
+        run: uv venv --seed
+
+      - name: Build DMG
+        run: uv run python packaging/build.py --macos-target 26.0
+
+      - name: Locate DMG
+        id: dmg
+        run: |
+          DMG=$(find packaging/dist -name "*.dmg" | head -1)
+          echo "path=$DMG" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$DMG")" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: "oMLX ${{ steps.ver.outputs.version }} (JANG)"
+          body: |
+            Fork of [jundot/omlx](https://github.com/jundot/omlx) with JANG mixed-precision support.
+
+            Changes over upstream:
+            - `omlx/engine/jang.py`: JANGLoader engine (726 lines)
+            - `omlx/engine_pool.py`: JANG dispatch + NameError fix
+            - `omlx/model_discovery.py`: auto-detect `jang_config.json`
+            - `omlx/models/vlm.py`: VLM adapter cleanup
+
+            PR to upstream: jundot/omlx#727
+          files: ${{ steps.dmg.outputs.path }}
+          prerelease: true

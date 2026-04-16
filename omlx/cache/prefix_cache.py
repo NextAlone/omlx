@@ -20,13 +20,7 @@ except ImportError:
 
 from .interface import CacheManager
 from .paged_ssd_cache import PagedSSDCacheManager
-from .paged_cache import (
-    BlockTable,
-    CacheBlock,
-    PagedCacheManager,
-    compute_block_hash,
-    resolve_block_extra_keys,
-)
+from .paged_cache import BlockTable, CacheBlock, PagedCacheManager, compute_block_hash
 from .stats import BaseCacheStats, PrefixCacheStats
 from .type_handlers import CacheType, CacheTypeHandler
 from .type_registry import CacheTypeRegistry
@@ -234,8 +228,6 @@ class BlockAwarePrefixCache(CacheManager):
         request_id: str,
         tokens: List[int],
         extra_keys: Optional[Tuple[Any, ...]] = None,
-        extra_key_token_start: Optional[int] = None,
-        extra_key_ranges: Optional[List[Tuple[int, Tuple[Any, ...]]]] = None,
     ) -> Tuple[Optional[BlockTable], List[int]]:
         """
         Find cached prefix blocks for the given tokens.
@@ -255,10 +247,7 @@ class BlockAwarePrefixCache(CacheManager):
 
         # Try to find shared prefix blocks
         shared_block_ids, remaining = self.paged_cache.find_shared_prefix(
-            tokens,
-            extra_keys=extra_keys,
-            extra_key_token_start=extra_key_token_start,
-            extra_key_ranges=extra_key_ranges,
+            tokens, extra_keys=extra_keys
         )
 
         if shared_block_ids:
@@ -322,8 +311,6 @@ class BlockAwarePrefixCache(CacheManager):
         model_cache_config: Optional[ModelCacheConfig] = None,
         boundary_snapshots: Optional[Dict[int, List[Any]]] = None,
         extra_keys: Optional[Tuple[Any, ...]] = None,
-        extra_key_token_start: Optional[int] = None,
-        extra_key_ranges: Optional[List[Tuple[int, Tuple[Any, ...]]]] = None,
     ) -> Optional[BlockTable]:
         """
         Store computed cache for future reuse.
@@ -446,20 +433,9 @@ class BlockAwarePrefixCache(CacheManager):
                 if prev_block and prev_block.block_hash:
                     parent_hash = prev_block.block_hash
 
-            block_extra_keys = resolve_block_extra_keys(
-                global_end,
-                extra_keys=extra_keys,
-                extra_key_token_start=extra_key_token_start,
-                extra_key_ranges=extra_key_ranges,
-            )
-
             # Check if this block already exists (deduplication)
             if len(block_tokens) == self.block_size:
-                existing_block = self.paged_cache.find_cached_block(
-                    block_tokens,
-                    parent_hash,
-                    extra_keys=block_extra_keys,
-                )
+                existing_block = self.paged_cache.find_cached_block(block_tokens, parent_hash)
                 if existing_block:
                     # Reuse existing block
                     self.paged_cache.increment_ref(existing_block.block_id)
@@ -486,13 +462,13 @@ class BlockAwarePrefixCache(CacheManager):
             # Compute chain hash for this block
             block.block_hash = compute_block_hash(
                 parent_hash, block_tokens,
-                extra_keys=block_extra_keys, model_name=self.paged_cache.model_name,
+                extra_keys=extra_keys, model_name=self.paged_cache.model_name,
             )
 
             # Register hash for full blocks (for deduplication)
             if len(block_tokens) == self.block_size:
                 self.paged_cache.register_block_hash(
-                    block, block_tokens, parent_hash, extra_keys=block_extra_keys
+                    block, block_tokens, parent_hash, extra_keys=extra_keys
                 )
 
             # Extract tensor slice and save to paged SSD

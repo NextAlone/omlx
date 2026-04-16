@@ -249,14 +249,7 @@ def _find_target_python() -> str:
         str(BUILD_DIR / f"cpython-{target_minor}" / "bin" / f"python{target_minor}"),
     ]
     for path in candidates:
-        if not path or not Path(path).exists():
-            continue
-        # Skip interpreters without pip (e.g. venvstacks runtimes strip it)
-        check = subprocess.run(
-            [path, "-m", "pip", "--version"],
-            capture_output=True,
-        )
-        if check.returncode == 0:
+        if path and Path(path).exists():
             return path
 
     print(f"  Warning: python{target_minor} not found, using {sys.executable}")
@@ -516,7 +509,7 @@ def build_venvstacks():
     # _lock_with_sdist_retry() builds them locally and retries automatically.
     print("\n  Locking environments...")
     lock_cmd = [
-        "pipx", "run", "venvstacks", "lock",
+        "uvx", "venvstacks", "lock",
         str(resolved_toml),
     ] + local_wheels_args
     if version_map:
@@ -529,7 +522,7 @@ def build_venvstacks():
     # Step 4: Build environments
     print("\n  Building environments (this may take a while)...")
     run_cmd([
-        "pipx", "run", "venvstacks", "build",
+        "uvx", "venvstacks", "build",
         str(resolved_toml),
         "--no-lock",
     ] + local_wheels_args)
@@ -540,7 +533,7 @@ def build_venvstacks():
         shutil.rmtree(EXPORT_DIR)
 
     run_cmd([
-        "pipx", "run", "venvstacks", "local-export",
+        "uvx", "venvstacks", "local-export",
         str(resolved_toml),
         "--output-dir", str(EXPORT_DIR),
     ])
@@ -1220,6 +1213,12 @@ def create_dmg(app_dir: Path):
     # Create Applications symlink
     applications_link = dmg_staging / "Applications"
     applications_link.symlink_to("/Applications")
+
+    # Detach any stale volume with the same name (flaky on CI runners)
+    subprocess.run(
+        ["hdiutil", "detach", f"/Volumes/{APP_NAME}"],
+        capture_output=True,
+    )
 
     print("  Creating DMG with Applications shortcut...")
     run_cmd([

@@ -24,7 +24,6 @@ import mlx.core as mx
 from mlx_lm.generate import (
     BatchGenerator,
     GenerationBatch,
-    PromptProcessingBatch,
     SequenceStateMachine,
     generation_stream,
 )
@@ -152,39 +151,6 @@ def _patched_generation_batch_step(self):
     return result
 
 GenerationBatch._step = _patched_generation_batch_step
-
-
-# Monkey-patch TurboQuantKVCache.merge so _merge_caches() works
-try:
-    from mlx_vlm.turboquant import TurboQuantKVCache as _TQCache
-    from .turboquant_kv import BatchTurboQuantKVCache as _BTQCache
-    if not hasattr(_TQCache, "merge"):
-        _TQCache.merge = _BTQCache.merge
-except ImportError:
-    pass
-
-
-# ---------------------------------------------------------------------------
-# Monkey-patch PromptProcessingBatch.prompt to set mRoPE deltas before the
-# prompt processing loop.  Without this, batched VLM prompt processing
-# (e.g. the 1-token final prompt after external prefill) falls into the
-# _wrap_caches fallback which collapses per-request offsets to a scalar,
-# corrupting attention masks for concurrent VLM requests.
-# ---------------------------------------------------------------------------
-_original_ppb_prompt = PromptProcessingBatch.prompt
-
-
-def _patched_ppb_prompt(self, tokens):
-    model = self.model
-    if (getattr(model, "_uses_mrope", False)
-            and getattr(model, "_uid_rope_deltas", None)
-            and self.uids):
-        deltas = [model._uid_rope_deltas.get(uid, 0.0) for uid in self.uids]
-        model.set_batch_rope_deltas(mx.array(deltas))
-    return _original_ppb_prompt(self, tokens)
-
-
-PromptProcessingBatch.prompt = _patched_ppb_prompt
 
 
 # Cache class names known to be sliceable (no boundary snapshots needed).
@@ -431,13 +397,7 @@ class Scheduler:
             config: Scheduler configuration
         """
         self.model = model
-        # Deep-copy the tokenizer so the scheduler owns an independent Rust
-        # tokenizer backend.  Without this, concurrent access from the asyncio
-        # event loop (encode/apply_chat_template in engine handlers) and the
-        # MLX executor thread (scheduler.step) causes
-        # "RuntimeError: Already borrowed" from the HuggingFace tokenizers
-        # Rust RefCell.  See: https://github.com/huggingface/tokenizers/issues/537
-        self.tokenizer = copy.deepcopy(tokenizer)
+        self.tokenizer = tokenizer
         self.config = copy.copy(config) if config else SchedulerConfig()
 
         # Load additional EOS tokens from generation_config.json.
@@ -454,7 +414,6 @@ class Scheduler:
 
         # TurboQuant KV cache (set by engine if model_settings has it enabled)
         self._turboquant_kv_bits: Optional[float] = None
-        self._turboquant_skip_last: bool = True
 
         # Request management - following vLLM's design
         self.waiting: deque[Request] = deque()  # Waiting queue (FCFS)
@@ -603,17 +562,8 @@ class Scheduler:
         # IOKit's asynchronous completeMemory() callbacks, causing
         # 'prepare count underflow' kernel panics. Deferring the clear
         # by a few generation steps gives IOKit time to process callbacks.
-        #
-        # Stored as the absolute step number at which the clear should fire,
-        # rather than a countdown integer.  This avoids the burst-completion
-        # bug (#557): with max_num_seqs > 1 two requests can finish in the
-        # same batch.  The old "only set if None" guard meant the second
-        # completion never extended the window, so the first request's KV
-        # cache blocks could be re-allocated before IOKit finished its
-        # completeMemory() callbacks.  Using max() ensures the window always
-        # covers the *latest* completion.
-        # None = no deferred clear pending; int = step at which to fire.
-        self._deferred_clear_at: Optional[int] = None
+        # None = no deferred clear pending; int = steps since last finish.
+        self._deferred_clear_steps: Optional[int] = None
 
         # Cache XTC special tokens (newline + EOS) — stable per tokenizer.
         # Must be after _is_harmony_model / _generation_config_eos init
@@ -1023,29 +973,17 @@ class Scheduler:
     # External prefill (composition pattern — replaces _process_prompts)
     # ------------------------------------------------------------------
 
-    def _apply_turboquant_kv_empty(self, prompt_cache: List[Any]) -> None:
-        """Replace KVCache with empty TurboQuantKVCache before prefill.
-
-        NOTE: Not currently called -- see #771. Kept for future use when
-        TurboQuantKVCache implements merge()/maybe_trim_front().
-
-        Tokens are quantized on the fly during update_and_fetch, avoiding
-        the peak memory spike from storing full-precision KV then converting.
-        Skips the last KVCache layer if turboquant_skip_last is set.
-        """
+    def _apply_turboquant_kv(self, prompt_cache: List[Any]) -> None:
+        """Convert individual KVCache layers to TurboQuantKVCache."""
+        from .turboquant_kv import BatchTurboQuantKVCache
         from mlx_vlm.turboquant import TurboQuantKVCache
         from mlx_lm.models.cache import KVCache, CacheList
-
-        kv_indices = [i for i, c in enumerate(prompt_cache) if isinstance(c, KVCache)]
-        skip_last = self._turboquant_skip_last and len(kv_indices) > 1
-        last_kv_idx = kv_indices[-1] if skip_last else -1
 
         converted = 0
         bits = float(self._turboquant_kv_bits)
         for i, cache_obj in enumerate(prompt_cache):
+            cls_name = type(cache_obj).__name__
             if isinstance(cache_obj, KVCache):
-                if i == last_kv_idx:
-                    continue
                 prompt_cache[i] = TurboQuantKVCache(bits=bits)
                 converted += 1
             elif isinstance(cache_obj, CacheList):
@@ -1058,50 +996,9 @@ class Scheduler:
                         new_caches.append(c)
                 cache_obj.caches = tuple(new_caches)
         if converted > 0:
-            skip_msg = ", skipped last KVCache layer" if skip_last else ""
-            logger.info(
-                f"TurboQuant: {converted}/{len(prompt_cache)} "
-                f"cache layers set to {bits}-bit{skip_msg}"
-            )
-
-    def _apply_turboquant_kv_convert(self, prompt_cache: List[Any]) -> None:
-        """Convert existing KVCache data to TurboQuantKVCache via from_cache().
-
-        NOTE: Not currently called -- see #771. Kept for future use when
-        TurboQuantKVCache implements merge()/maybe_trim_front().
-
-        Used when an existing cache is provided (e.g. from SSD prefix cache).
-        Uses from_cache() to quantize the existing KV data.
-        """
-        from mlx_vlm.turboquant import TurboQuantKVCache
-        from mlx_lm.models.cache import KVCache, CacheList
-
-        kv_indices = [i for i, c in enumerate(prompt_cache) if isinstance(c, KVCache)]
-        skip_last = self._turboquant_skip_last and len(kv_indices) > 1
-        last_kv_idx = kv_indices[-1] if skip_last else -1
-
-        converted = 0
-        bits = float(self._turboquant_kv_bits)
-        for i, cache_obj in enumerate(prompt_cache):
-            if isinstance(cache_obj, KVCache):
-                if i == last_kv_idx:
-                    continue
-                prompt_cache[i] = TurboQuantKVCache.from_cache(cache_obj, bits=bits)
-                converted += 1
-            elif isinstance(cache_obj, CacheList):
-                new_caches = []
-                for c in cache_obj.caches:
-                    if isinstance(c, KVCache):
-                        new_caches.append(TurboQuantKVCache.from_cache(c, bits=bits))
-                        converted += 1
-                    else:
-                        new_caches.append(c)
-                cache_obj.caches = tuple(new_caches)
-        if converted > 0:
-            skip_msg = ", skipped last KVCache layer" if skip_last else ""
             logger.info(
                 f"TurboQuant: converted {converted}/{len(prompt_cache)} "
-                f"cache layers to {bits}-bit{skip_msg}"
+                f"cache layers to {bits}-bit"
             )
 
     def _do_external_prefill(
@@ -1150,13 +1047,10 @@ class Scheduler:
             prompt_cache = make_prompt_cache(self.model)
 
         # NOTE: TurboQuant conversion is NOT applied during external prefill.
-        # TurboQuantKVCache does not support merge() or maybe_trim_front(),
-        # so passing it to insert() would fail in _merge_caches() or cause
-        # AttributeError in chunked-attention models (e.g. Llama-4-Scout).
-        # Additionally, on-the-fly quantization during prefill causes
-        # precision loss that corrupts hidden states across layers (#771).
-        # Prefill runs with standard KVCache; TurboQuant quantization
-        # happens inside BatchGenerator during the decode phase.
+        # TurboQuantKVCache.merge() is not implemented, so passing it to
+        # insert() would fail in _merge_caches(). Prefill runs with standard
+        # KVCache; TurboQuant can be applied later inside BatchGenerator if
+        # a monkey-patch on PromptProcessingBatch is desired.
 
         # Clear stale mRoPE position state for text-only requests.
         if vlm_embeds is None and hasattr(self.model, "clear_vlm_position_state"):
@@ -2302,12 +2196,15 @@ class Scheduler:
         # Check prefix cache for cached KV state
         if self.block_aware_cache is not None:
             # Use paged cache
+            # Build extra_keys for VLM image hash prefix cache isolation
+            extra_keys = None
+            if request.vlm_image_hash:
+                extra_keys = (request.vlm_image_hash,)
+
             block_table, remaining = self.block_aware_cache.fetch_cache(
                 request.request_id,
                 request.prompt_token_ids,
-                extra_keys=request.vlm_extra_keys_for_cache,
-                extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
-                extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
+                extra_keys=extra_keys,
             )
             if block_table and block_table.num_tokens > 0:
                 # Reconstruct actual KVCache objects from stored tensor data
@@ -2558,12 +2455,9 @@ class Scheduler:
                 except Exception as e:
                     logger.debug(f"SpecPrefill: draft cache store failed: {e}")
 
-            # Free draft cache from memory.  Use _sync_and_clear_cache() so
-            # the generation_stream is drained before Metal buffers are
-            # returned to the pool — a bare mx.clear_cache() here can race
-            # with in-flight async evals and trigger a kernel panic (#557).
+            # Free draft cache from memory
             del used_cache
-            _sync_and_clear_cache()
+            mx.clear_cache()
 
         except Exception as e:
             logger.error(f"SpecPrefill scoring failed, falling back to normal path: {e}")
@@ -2757,11 +2651,11 @@ class Scheduler:
 
         Also returns True when a deferred Metal cache clear is pending,
         so that the engine loop keeps calling step() until the clear fires.
-        Without this, an idle server would never reach the target step and
-        stale buffers would accumulate indefinitely.
+        Without this, an idle server would never increment the deferred
+        counter and stale buffers would accumulate indefinitely.
         """
         return bool(self.waiting or self.running
-                     or self._deferred_clear_at is not None)
+                     or self._deferred_clear_steps is not None)
 
     def fail_all_requests(self) -> List[str]:
         """Remove all running and waiting requests after unrecoverable error.
@@ -3058,14 +2952,7 @@ class Scheduler:
                             self.model(sys_arr[:step][None], cache=sp_cache)
                             mx.eval([c.state for c in sp_cache])
                             sys_arr = sys_arr[step:]
-                            # Use _sync_and_clear_cache() instead of bare
-                            # mx.clear_cache() to flush the generation_stream
-                            # before releasing Metal buffers.  A bare call here
-                            # can race with in-flight command buffers submitted
-                            # by the preceding mx.eval(), triggering the same
-                            # 'completeMemory() prepare count underflow' kernel
-                            # panic that #435 fixed elsewhere (#557).
-                            _sync_and_clear_cache()
+                            mx.clear_cache()
                         if sys_arr.size > 0:
                             self.model(sys_arr[None], cache=sp_cache)
                             mx.eval([c.state for c in sp_cache])
@@ -3155,12 +3042,6 @@ class Scheduler:
                 del self.uid_to_request_id[temp_uid]
                 del self.request_id_to_uid[request.request_id]
 
-                # Prefill complete: remove from progress tracker so dashboard
-                # shows "generating" instead of "PP" during decode.
-                from .prefill_progress import get_prefill_tracker
-
-                get_prefill_tracker().remove(request.request_id)
-
                 cache_to_use = prefilled_cache
                 tokens_to_process = last_token
 
@@ -3187,9 +3068,6 @@ class Scheduler:
             # may interfere. Matches OpenAI's best-effort seed semantics.
             if request.sampling_params.seed is not None:
                 mx.random.seed(request.sampling_params.seed)
-
-            # NOTE: TurboQuant KV conversion is not applied during prefill.
-            # See _do_external_prefill() comment for rationale (#771).
 
             # Insert into BatchGenerator with pre-filled cache + last token.
             # BatchGenerator only handles decode from here.
@@ -3347,10 +3225,6 @@ class Scheduler:
                         output.new_text += final_result.stream_text
                     if final_result.visible_text:
                         request.output_text += final_result.visible_text
-                    if final_result.output_text_prefix:
-                        request.output_text = (
-                            final_result.output_text_prefix + request.output_text
-                        )
                     if final_result.tool_calls:
                         output.tool_calls = final_result.tool_calls
                     if final_result.finish_reason:
@@ -3491,15 +3365,18 @@ class Scheduler:
                                         f"intermediate snapshots)"
                                     )
 
+                                # Build extra_keys for VLM image hash
+                                store_extra_keys = None
+                                if request.vlm_image_hash:
+                                    store_extra_keys = (request.vlm_image_hash,)
+
                                 block_table = self.block_aware_cache.store_cache(
                                     request_id,
                                     token_sequence_to_store,
                                     cache_to_store,
                                     model_cache_config=model_cache_config,
                                     boundary_snapshots=intermediate_snapshots,
-                                    extra_keys=request.vlm_extra_keys_for_cache,
-                                    extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
-                                    extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
+                                    extra_keys=store_extra_keys,
                                 )
                             logger.debug(
                                 f"Stored paged cache for request {request_id} "
@@ -3594,16 +3471,10 @@ class Scheduler:
             # Deferring by _DEFERRED_CLEAR_DELAY generation steps (~10-40 ms) gives
             # IOKit time to process callbacks while still reclaiming buffers fast
             # enough to prevent TTFT spikes from pool bloat (#411).
-            #
-            # Use max() so that concurrent completions (max_num_seqs > 1) each get
-            # a full _DEFERRED_CLEAR_DELAY window counted from *their own* finish
-            # step.  The old "only set if None" guard meant the second request's
-            # window was anchored to the first request's finish step, allowing the
-            # second request's KV cache blocks to be re-allocated before IOKit
-            # finished their completeMemory() callbacks (#557).
-            target = self._step_counter + self._DEFERRED_CLEAR_DELAY
-            if self._deferred_clear_at is None or target > self._deferred_clear_at:
-                self._deferred_clear_at = target
+            # Only set if not already pending — otherwise burst completions
+            # would keep resetting the counter and indefinitely postpone clearing.
+            if self._deferred_clear_steps is None:
+                self._deferred_clear_steps = 0
 
     def _is_cache_corruption_error(self, error: Exception) -> bool:
         """Check if an error indicates cache corruption."""
@@ -3636,7 +3507,7 @@ class Scheduler:
         self.uid_to_request_id.clear()
 
         # Cancel any pending deferred Metal cache clear
-        self._deferred_clear_at = None
+        self._deferred_clear_steps = None
 
         # Clear detokenizer state to prevent contamination after recovery
         self._request_detokenizers.clear()
@@ -3818,11 +3689,14 @@ class Scheduler:
             and self._step_counter % self.config.mlx_cache_cleanup_interval == 0
         ):
             should_clear = True
-        # Deferred post-completion cleanup: fire once the step counter reaches
-        # the target set by _cleanup_finished() (#435, #557).
-        if self._deferred_clear_at is not None and self._step_counter >= self._deferred_clear_at:
-            should_clear = True
-            self._deferred_clear_at = None
+        # Deferred post-completion cleanup: wait _DEFERRED_CLEAR_DELAY steps
+        # after the last request completion to give IOKit time to process
+        # completeMemory() callbacks before releasing Metal buffers (#435).
+        if self._deferred_clear_steps is not None:
+            self._deferred_clear_steps += 1
+            if self._deferred_clear_steps >= self._DEFERRED_CLEAR_DELAY:
+                should_clear = True
+                self._deferred_clear_steps = None
         if should_clear:
             _sync_and_clear_cache()
         if (
@@ -3894,7 +3768,7 @@ class Scheduler:
         self._output_parser_sessions.clear()
 
         # Cancel any pending deferred Metal cache clear
-        self._deferred_clear_at = None
+        self._deferred_clear_steps = None
 
     def deep_reset(self) -> None:
         """

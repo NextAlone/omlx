@@ -25,7 +25,6 @@
 
             activeTab: 'global',
             settingsDropdown: false,
-            themeDropdown: false,
 
             // Global settings
             globalSettings: {
@@ -38,10 +37,9 @@
                 sampling: { max_context_window: 32768, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '' },
                 huggingface: { endpoint: '' },
-                network: { http_proxy: '', https_proxy: '', no_proxy: '', ca_bundle: '' },
                 auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, sub_keys: [] },
                 claude_code: { context_scaling_enabled: false, target_context_size: 200000, mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
-                integrations: { codex_model: null, opencode_model: null, openclaw_model: null, pi_model: null, openclaw_tools_profile: 'full' },
+                integrations: { codex_model: null, opencode_model: null, openclaw_model: null, openclaw_tools_profile: 'full' },
                 ui: { language: 'en' },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '' },
             },
@@ -106,7 +104,6 @@
             },
             savingModelSettings: false,
             loadingGenDefaults: false,
-            reasoningParsers: [],
 
             // Status tab state
             stats: {
@@ -145,10 +142,6 @@
                 avg_generation_tps: 0.0,
                 total_requests: 0,
             },
-            // Server connectivity info (from /admin/api/server-info)
-            serverAliases: [],
-            selectedAlias: '',
-
             statsScope: 'session',
             selectedStatsModel: '',
             showClearStatsConfirm: false,
@@ -365,7 +358,6 @@
                 await Promise.all([
                     this.loadGlobalSettings(),
                     this.loadModels(),
-                    this.loadServerInfo(),
                     this.checkForUpdate()
                 ]);
 
@@ -572,7 +564,6 @@
                             sampling: { ...this.globalSettings.sampling, ...data.sampling },
                             mcp: { ...this.globalSettings.mcp, ...data.mcp },
                             huggingface: { ...this.globalSettings.huggingface, ...data.huggingface },
-                            network: { ...this.globalSettings.network, ...data.network },
                             auth: { ...this.globalSettings.auth, ...data.auth },
                             claude_code: { ...this.globalSettings.claude_code, ...data.claude_code },
                             integrations: { ...this.globalSettings.integrations, ...data.integrations },
@@ -689,10 +680,6 @@
                             sampling_top_k: this.globalSettings.sampling.top_k,
                             sampling_repetition_penalty: this.globalSettings.sampling.repetition_penalty,
                             mcp_config: this.globalSettings.mcp.config_path,
-                            network_http_proxy: this.globalSettings.network.http_proxy,
-                            network_https_proxy: this.globalSettings.network.https_proxy,
-                            network_no_proxy: this.globalSettings.network.no_proxy,
-                            network_ca_bundle: this.globalSettings.network.ca_bundle,
                             ...(this.globalSettings.auth.api_key ? { api_key: this.globalSettings.auth.api_key } : {}),
                             skip_api_key_verification: this.globalSettings.auth.skip_api_key_verification,
                         }),
@@ -896,14 +883,7 @@
                 }
             },
 
-            async openModelSettings(model) {
-                if (this.reasoningParsers.length === 0) {
-                    try {
-                        const resp = await fetch('/admin/api/grammar/parsers');
-                        if (resp.ok) this.reasoningParsers = await resp.json();
-                        else if (resp.status === 401) window.location.href = '/admin';
-                    } catch (_) { /* network error */ }
-                }
+            openModelSettings(model) {
                 this.selectedModel = model;
                 // Load existing settings if available
                 const settings = model.settings || {};
@@ -933,8 +913,6 @@
                     min_p: settings.min_p ?? null,
                     presence_penalty: settings.presence_penalty ?? null,
                     force_sampling: settings.force_sampling || false,
-                    enable_thinking: settings.enable_thinking ?? null,
-                    thinking_default: model.thinking_default ?? null,
                     enableThinkingBudget: !!(settings.thinking_budget_tokens),
                     thinking_budget_tokens: settings.thinking_budget_tokens || null,
                     enableToolResultLimit: !!(settings.max_tool_result_tokens),
@@ -949,9 +927,6 @@
                     specprefill_draft_model: settings.specprefill_draft_model || '',
                     specprefill_keep_pct: settings.specprefill_keep_pct ? String(settings.specprefill_keep_pct) : '0.2',
                     specprefill_threshold: settings.specprefill_threshold || null,
-                    dflash_enabled: settings.dflash_enabled || false,
-                    dflash_draft_model: settings.dflash_draft_model || '',
-                    dflash_draft_quant_bits: settings.dflash_draft_quant_bits ? String(settings.dflash_draft_quant_bits) : '',
                     ctKwargEntries,
                 };
                 this.showModelSettingsModal = true;
@@ -1003,7 +978,6 @@
                                 index_cache_freq: this.modelSettings.enableIndexCache
                                     ? (this.modelSettings.index_cache_freq || 4)
                                     : 0,
-                                enable_thinking: this.modelSettings.enable_thinking,
                                 thinking_budget_enabled: this.modelSettings.enableThinkingBudget,
                                 thinking_budget_tokens: this.modelSettings.enableThinkingBudget
                                     ? (this.modelSettings.thinking_budget_tokens || null)
@@ -1026,11 +1000,6 @@
                                     : null,
                                 specprefill_threshold: this.modelSettings.specprefill_enabled
                                     ? (this.modelSettings.specprefill_threshold || null)
-                                    : null,
-                                dflash_enabled: this.modelSettings.dflash_enabled,
-                                dflash_draft_model: this.modelSettings.dflash_draft_model || null,
-                                dflash_draft_quant_bits: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_bits
-                                    ? parseInt(this.modelSettings.dflash_draft_quant_bits)
                                     : null,
                             };
                         })()),
@@ -1098,52 +1067,11 @@
             },
 
             // Status tab functions
-            // Normalizes a host string for safe URL embedding:
-            //  - unwraps existing IPv6 brackets so we can re-bracket consistently
-            //  - maps unspecified bind addresses (0.0.0.0, ::) to a placeholder
-            //    since they are not routable from a client
-            //  - maps `localhost` to 127.0.0.1 for consistency with other URLs
-            //  - bracket-wraps IPv6 addresses per RFC 3986 (`http://[::1]:8000/v1`)
-            formatDisplayHost(host) {
-                const value = (host || '').trim();
-                if (!value) return '127.0.0.1';
-
-                const unwrapped = value.startsWith('[') && value.endsWith(']')
-                    ? value.slice(1, -1)
-                    : value;
-
-                if (unwrapped === '0.0.0.0' || unwrapped === '::') return 'your-ip-address';
-                if (unwrapped === 'localhost') return '127.0.0.1';
-                if (unwrapped.includes(':')) return `[${unwrapped}]`;
-                return unwrapped;
-            },
-
             get displayHost() {
-                const host = this.selectedAlias || this.stats.host || '127.0.0.1';
-                return this.formatDisplayHost(host);
-            },
-
-            async loadServerInfo() {
-                try {
-                    const response = await fetch('/admin/api/server-info');
-                    if (response.ok) {
-                        const data = await response.json();
-                        const aliases = Array.isArray(data.aliases) ? data.aliases : [];
-                        this.serverAliases = aliases;
-                        // Preserve user selection across reloads if still valid;
-                        // otherwise default to the first alias when available.
-                        if (this.selectedAlias && !aliases.includes(this.selectedAlias)) {
-                            this.selectedAlias = '';
-                        }
-                        if (!this.selectedAlias && aliases.length > 0) {
-                            this.selectedAlias = aliases[0];
-                        }
-                    } else if (response.status === 401) {
-                        window.location.href = '/admin';
-                    }
-                } catch (err) {
-                    console.error('Failed to load server info:', err);
-                }
+                const host = this.stats.host || '127.0.0.1';
+                if (host === '0.0.0.0') return 'your-ip-address';
+                if (host === 'localhost') return '127.0.0.1';
+                return host;
             },
 
             get llmModels() {
@@ -1238,16 +1166,6 @@
                 return parts.join(' ');
             },
 
-            get piCommand() {
-                const cli = this.stats.cli_prefix || 'omlx';
-                const model = this.globalSettings.integrations.pi_model || 'select-a-model';
-                const parts = [`${this.shellQuote(cli)} launch pi --model ${this.shellQuote(model)}`];
-                if (this.stats.api_key) {
-                    parts.push(`--api-key ${this.shellQuote(this.stats.api_key)}`);
-                }
-                return parts.join(' ');
-            },
-
             async saveIntegrationSettings() {
                 try {
                     const response = await fetch('/admin/api/global-settings', {
@@ -1257,7 +1175,6 @@
                             integrations_codex_model: this.globalSettings.integrations.codex_model,
                             integrations_opencode_model: this.globalSettings.integrations.opencode_model,
                             integrations_openclaw_model: this.globalSettings.integrations.openclaw_model,
-                            integrations_pi_model: this.globalSettings.integrations.pi_model,
                             integrations_openclaw_tools_profile: this.globalSettings.integrations.openclaw_tools_profile,
                         }),
                     });

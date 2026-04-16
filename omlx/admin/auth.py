@@ -220,10 +220,14 @@ async def require_admin(request: Request) -> bool:
         ... async def get_settings(is_admin: bool = Depends(require_admin)):
         ...     return {"settings": "..."}
     """
-    # Skip admin auth when skip_api_key_verification is enabled
+    # Skip admin auth when skip_api_key_verification is enabled on localhost
     if _get_global_settings is not None:
         gs = _get_global_settings()
-        if gs is not None and gs.auth.skip_api_key_verification:
+        if (
+            gs is not None
+            and gs.auth.skip_api_key_verification
+            and gs.server.host == "127.0.0.1"
+        ):
             return True
 
     if not verify_session(request):

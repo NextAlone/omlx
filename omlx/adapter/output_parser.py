@@ -37,7 +37,6 @@ class OutputParserFinalizeResult:
 
     stream_text: str = ""
     visible_text: str = ""
-    output_text_prefix: str = ""
     tool_calls: list[dict[str, str]] = field(default_factory=list)
     finish_reason: str | None = None
 
@@ -124,19 +123,12 @@ class HarmonyOutputParserSession:
                 if self._parser.current_channel == "final":
                     visible_text += final_text
 
-        _, analysis_text, tool_calls = parse_tool_calls_from_tokens(
-            self._raw_token_ids
-        )
+        _, tool_calls = parse_tool_calls_from_tokens(self._raw_token_ids)
         finish_reason = "tool_calls" if tool_calls else None
-
-        output_text_prefix = (
-            f"<think>\n{analysis_text}\n</think>\n" if analysis_text else ""
-        )
 
         return OutputParserFinalizeResult(
             stream_text=stream_text,
             visible_text=visible_text,
-            output_text_prefix=output_text_prefix,
             tool_calls=tool_calls,
             finish_reason=finish_reason,
         )

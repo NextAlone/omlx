@@ -267,7 +267,7 @@ class TestSkipApiKeyVerification:
         return gs
 
     def test_skip_verification_when_localhost(self):
-        """Skip API key verification when enabled."""
+        """Skip API key verification when enabled and host is localhost."""
         from omlx.server import verify_api_key, _server_state
         import asyncio
 
@@ -285,9 +285,10 @@ class TestSkipApiKeyVerification:
             _server_state.api_key = original_key
             _server_state.global_settings = original_gs
 
-    def test_skip_verification_on_any_host(self):
-        """Skip verification when enabled regardless of host."""
+    def test_skip_verification_ignored_when_not_localhost(self):
+        """Do not skip verification when host is not localhost."""
         from omlx.server import verify_api_key, _server_state
+        from fastapi import HTTPException
         import asyncio
 
         original_key = _server_state.api_key
@@ -298,8 +299,9 @@ class TestSkipApiKeyVerification:
         )
 
         try:
-            result = asyncio.run(verify_api_key(request=_mock_request(), credentials=None))
-            assert result is True
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(verify_api_key(request=_mock_request(), credentials=None))
+            assert exc_info.value.status_code == 401
         finally:
             _server_state.api_key = original_key
             _server_state.global_settings = original_gs

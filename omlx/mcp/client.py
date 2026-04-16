@@ -198,10 +198,7 @@ class MCPClient:
             self._session = ClientSession(self._read, self._write)
             await self._session.__aenter__()
         except Exception:
-            if (
-                hasattr(self, "_streamable_http_client")
-                and self._streamable_http_client
-            ):
+            if hasattr(self, '_streamable_http_client') and self._streamable_http_client:
                 await self._streamable_http_client.__aexit__(None, None, None)
                 self._streamable_http_client = None
             await self._http_client.__aexit__(None, None, None)
@@ -235,9 +232,7 @@ class MCPClient:
                     server_name=self.name,
                     name=tool.name,
                     description=tool.description or "",
-                    input_schema=tool.inputSchema
-                    if hasattr(tool, "inputSchema")
-                    else {},
+                    input_schema=tool.inputSchema if hasattr(tool, 'inputSchema') else {},
                 )
                 self._tools.append(mcp_tool)
                 logger.debug(f"Discovered tool: {mcp_tool.full_name}")
@@ -253,11 +248,11 @@ class MCPClient:
                 await self._session.__aexit__(None, None, None)
                 self._session = None
 
-            if hasattr(self, "_stdio_client") and self._stdio_client:
+            if hasattr(self, '_stdio_client') and self._stdio_client:
                 await self._stdio_client.__aexit__(None, None, None)
                 self._stdio_client = None
 
-            if hasattr(self, "_sse_client") and self._sse_client:
+            if hasattr(self, '_sse_client') and self._sse_client:
                 await self._sse_client.__aexit__(None, None, None)
                 self._sse_client = None
 
@@ -336,7 +331,7 @@ class MCPClient:
             return MCPToolResult(
                 tool_name=tool_name,
                 content=content,
-                is_error=result.isError if hasattr(result, "isError") else False,
+                is_error=result.isError if hasattr(result, 'isError') else False,
             )
 
         except asyncio.TimeoutError:
@@ -356,18 +351,15 @@ class MCPClient:
 
     def _extract_content(self, result) -> Any:
         """Extract content from MCP tool result."""
-        if not hasattr(result, "content") or not result.content:
-            # Fall back to structuredContent if available
-            if hasattr(result, "structuredContent") and result.structuredContent:
-                return result.structuredContent
+        if not hasattr(result, 'content') or not result.content:
             return None
 
         # Handle list of content items
         contents = []
         for item in result.content:
-            if hasattr(item, "text"):
+            if hasattr(item, 'text'):
                 contents.append(item.text)
-            elif hasattr(item, "data"):
+            elif hasattr(item, 'data'):
                 contents.append(item.data)
             else:
                 contents.append(str(item))
