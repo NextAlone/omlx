@@ -27,6 +27,7 @@ import mlx.core as mx
 
 from .engine import BaseEngine, BatchedEngine
 from .engine.embedding import EmbeddingEngine
+from .engine.jang import JANGLoader
 from .engine.reranker import RerankerEngine
 from .engine.stt import STTEngine
 from .engine.sts import STSEngine
@@ -53,7 +54,7 @@ class EngineEntry:
     model_id: str  # Directory name (e.g., "llama-3b")
     model_path: str  # Full path to model directory
     model_type: Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]  # Model type
-    engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm", "audio_stt", "audio_tts", "audio_sts"]  # Engine type to use
+    engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm", "jang", "audio_stt", "audio_tts", "audio_sts"]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
@@ -654,6 +655,12 @@ class EnginePool:
                     engine = VLMBatchedEngine(
                         model_name=entry.model_path,
                         trust_remote_code=trc,
+                        scheduler_config=self._scheduler_config,
+                        model_settings=model_settings,
+                    )
+                elif effective_type == "jang":
+                    engine = JANGLoader(
+                        model_name=entry.model_path,
                         scheduler_config=self._scheduler_config,
                         model_settings=model_settings,
                     )
