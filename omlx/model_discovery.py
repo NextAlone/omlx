@@ -24,7 +24,10 @@ from typing import Literal
 logger = logging.getLogger(__name__)
 
 ModelType = Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
-EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
+EngineType = Literal["batched", "vlm", "embedding", "reranker", "jang", "audio_stt", "audio_tts", "audio_sts"]
+
+# JANG model config file names
+JANG_CONFIG_FILES = ("jang_config.json", "jjqf_config.json", "jang_cfg.json")
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
@@ -332,6 +335,31 @@ def _is_causal_lm_embedding(model_path: Path) -> bool:
     return "embedding" in name_lower or "embed" in name_lower
 
 
+def _is_jang_model(model_path: Path) -> bool:
+    """Check whether a directory contains a JANG model config file."""
+    return any((model_path / name).exists() for name in JANG_CONFIG_FILES)
+
+
+def _get_jang_has_vision(model_path: Path) -> bool | None:
+    """Read `architecture.has_vision` from a JANG config file if present."""
+    for cfg_name in JANG_CONFIG_FILES:
+        jang_config_path = model_path / cfg_name
+        if not jang_config_path.exists():
+            continue
+
+        try:
+            with open(jang_config_path) as f:
+                jang_config = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return None
+
+        architecture = jang_config.get("architecture", {})
+        has_vision = architecture.get("has_vision") if isinstance(architecture, dict) else None
+        return has_vision if isinstance(has_vision, bool) else None
+
+    return None
+
+
 def _has_sentence_transformers_embedding_pipeline(model_path: Path) -> bool:
     """
     Detect sentence-transformers style embedding exports via modules.json.
@@ -387,6 +415,11 @@ def detect_model_type(model_path: Path) -> ModelType:
     Returns:
         Model type: "llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", or "audio_sts"
     """
+    is_jang = _is_jang_model(model_path)
+    jang_has_vision = _get_jang_has_vision(model_path)
+    if jang_has_vision is not None:
+        return "vlm" if jang_has_vision else "llm"
+
     config_path = model_path / "config.json"
     if not config_path.exists():
         return "llm"
@@ -396,6 +429,9 @@ def detect_model_type(model_path: Path) -> ModelType:
             config = json.load(f)
     except (json.JSONDecodeError, IOError):
         return "llm"
+
+    if is_jang and (model_path / "preprocessor_config.json").exists():
+        return "vlm"
 
     # Check architectures field for reranker first (more specific)
     architectures = config.get("architectures", [])
@@ -647,8 +683,10 @@ def _is_adapter_dir(path: Path) -> bool:
 
 
 def _is_model_dir(path: Path) -> bool:
-    """Check if a directory contains a valid model (has config.json)."""
-    return (path / "config.json").exists() and not _is_adapter_dir(path)
+    """Check if a directory contains a valid model config."""
+    if _is_adapter_dir(path):
+        return False
+    return (path / "config.json").exists() or _is_jang_model(path)
 
 
 def _resolve_hf_cache_entry(path: Path) -> tuple[Path, str] | None:
@@ -687,10 +725,14 @@ def _register_model(
             return
 
         model_type = detect_model_type(model_dir)
+        is_jang = _is_jang_model(model_dir)
+
         if model_type == "embedding":
             engine_type: EngineType = "embedding"
         elif model_type == "reranker":
             engine_type = "reranker"
+        elif is_jang:
+            engine_type = "jang"
         elif model_type == "vlm":
             engine_type = "vlm"
         elif model_type == "audio_stt":

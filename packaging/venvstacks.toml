@@ -76,6 +76,8 @@ requirements = [
     "webrtcvad>=2.0.10",
     # NOTE: mlx-audio is built from git and installed with --no-deps in build.py
     # because mlx-audio pins mlx-lm==0.31.1 which conflicts with our git-pinned mlx-lm (v0.31.3)
+    # JANG mixed-precision quantization loader
+    "jang[mlx]",
 ]
 platforms = [
     "macosx_arm64",
